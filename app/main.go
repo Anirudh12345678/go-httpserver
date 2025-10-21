@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net"
 )
@@ -11,9 +12,25 @@ func main() {
 	if err != nil {
 		log.Fatal("Could not create listener")
 	}
-	_, err = l.Accept()
+	defer l.Close()
 
-	if err != nil {
-		log.Fatal("Error Accepting Connection Request on listener")
+	for {
+		con, err := l.Accept()
+		if err != nil {
+			return
+		}
+
+		go func(con net.Conn) {
+			defer con.Close()
+
+			respStr := "HTTP/1.1 200 OK\r\n\r\n"
+			resp := []byte(respStr)
+			n, err := con.Write(resp)
+			if err != nil {
+				log.Fatal("Could not reply")
+			}
+
+			fmt.Printf("Wrote %v bytes\n", n)
+		}(con)
 	}
 }
