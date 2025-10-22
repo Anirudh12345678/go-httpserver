@@ -3,3 +3,4 @@ codecrafters.yml
 .codecrafters/
 your_program.sh
 .gitattributes
+app/files/
