@@ -46,12 +46,11 @@ func main() {
 	}
 }
 
-func extractHeaders(buffStr string) map[string]string {
+func extractHeaders(buffStr string) (map[string]string, string) {
 	parts := strings.SplitN(buffStr, "\r\n\r\n", 2)
 	headerPart := parts[0]
-
+	reqBody := parts[1]
 	lines := strings.Split(headerPart, "\r\n")
-	// reqLine := lines[0]
 	headers := lines[1:]
 
 	headerMap := make(map[string]string)
@@ -69,18 +68,21 @@ func extractHeaders(buffStr string) map[string]string {
 		headerMap[key] = val
 	}
 
-	return headerMap
+	return headerMap, reqBody
 }
 
 func handleUrl(conBuff *[]byte, con *net.Conn) {
 	var out bool = false
 	buffStr := string(*conBuff)
 	reqLine := strings.Split(buffStr, "\n")[0]
-
+	reqType := strings.Split(reqLine, " ")[0]
 	reqUrl := strings.Split(reqLine, " ")[1]
 	fmt.Println(reqUrl)
-	headerMap := extractHeaders(buffStr)
+	headerMap, body := extractHeaders(buffStr)
 
+	if reqType == "POST" {
+		handlePost(con, &body, &reqUrl, &out)
+	}
 	if _, exists := routeSet[reqUrl]; exists {
 		switch reqUrl {
 		case "/":
@@ -141,5 +143,35 @@ func handleUrl(conBuff *[]byte, con *net.Conn) {
 
 	if !out {
 		(*con).Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
+	}
+}
+
+func handlePost(con *net.Conn, body *string, url *string, out *bool) {
+	re := regexp.MustCompile(`/files/([^/]+)$`)
+
+	match := re.FindStringSubmatch(*url)
+	if len(match) > 1 {
+		fileName := match[1]
+		filePath := fmt.Sprintf("app/files/%s", fileName)
+		file, err := os.Create(filePath)
+		if err != nil {
+			log.Println("Could not create requested file")
+			resp := "HTTP/1.1 404 Not Found\r\n\r\n"
+			(*con).Write([]byte(resp))
+			*out = true
+			return
+		}
+
+		_, err = file.Write([]byte(*body))
+		if err != nil {
+			log.Println("Could not create requested file")
+			resp := "HTTP/1.1 404 Not Found\r\n\r\n"
+			(*con).Write([]byte(resp))
+			*out = true
+			return
+		}
+
+		(*con).Write([]byte("HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+		*out = true
 	}
 }
