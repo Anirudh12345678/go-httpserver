@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"log"
 	"net"
@@ -9,169 +10,221 @@ import (
 	"strings"
 )
 
-var registeredRoutes = []string{"/", "/user-agent"}
+type Request struct {
+	Method  string
+	Path    string
+	Version string
+	Headers map[string]string
+	Body    string
+}
 
-var routeSet = make(map[string]struct{}, len(registeredRoutes))
+type Response struct {
+	StatusCode int
+	StatusText string
+	Headers    map[string]string
+	Body       string
+}
+
+type HandlerFunc func(req *Request) Response
+
+// --- Router ---
+
+type Router struct {
+	staticRoutes  map[string]HandlerFunc
+	dynamicRoutes []struct {
+		pattern *regexp.Regexp
+		handler HandlerFunc
+	}
+}
+
+func NewRouter() *Router {
+	return &Router{
+		staticRoutes: make(map[string]HandlerFunc),
+		dynamicRoutes: []struct {
+			pattern *regexp.Regexp
+			handler HandlerFunc
+		}{},
+	}
+}
+
+func (r *Router) Handle(path string, handler HandlerFunc) {
+	r.staticRoutes[path] = handler
+}
+
+func (r *Router) HandleDynamic(pattern string, handler HandlerFunc) {
+	re := regexp.MustCompile(pattern)
+	r.dynamicRoutes = append(r.dynamicRoutes, struct {
+		pattern *regexp.Regexp
+		handler HandlerFunc
+	}{re, handler})
+}
+
+func (r *Router) FindHandler(path string) HandlerFunc {
+	if handler, ok := r.staticRoutes[path]; ok {
+		return handler
+	}
+	for _, route := range r.dynamicRoutes {
+		if route.pattern.MatchString(path) {
+			return route.handler
+		}
+	}
+	return nil
+}
+
+// --- HTTP Parsing ---
+
+func parseRequest(conn net.Conn) (*Request, error) {
+	reader := bufio.NewReader(conn)
+	reqLine, err := reader.ReadString('\n')
+	if err != nil {
+		return nil, err
+	}
+	reqLine = strings.TrimRight(reqLine, "\r\n")
+
+	parts := strings.Fields(reqLine)
+	if len(parts) < 3 {
+		return nil, fmt.Errorf("malformed request line: %v", reqLine)
+	}
+	method, path, version := parts[0], parts[1], parts[2]
+
+	headers := make(map[string]string)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			break
+		}
+		k, v, _ := strings.Cut(line, ":")
+		headers[strings.ToLower(strings.TrimSpace(k))] = strings.TrimSpace(v)
+	}
+
+	var body string
+	if cl, ok := headers["content-length"]; ok {
+		length := 0
+		fmt.Sscanf(cl, "%d", &length)
+		buf := make([]byte, length)
+		_, err := reader.Read(buf)
+		if err != nil {
+			return nil, err
+		}
+		body = string(buf)
+	}
+
+	return &Request{
+		Method:  method,
+		Path:    path,
+		Version: version,
+		Headers: headers,
+		Body:    body,
+	}, nil
+}
+
+// --- Response Writer ---
+
+func writeResponse(conn net.Conn, res Response) {
+	if res.Headers == nil {
+		res.Headers = make(map[string]string)
+	}
+
+	if _, ok := res.Headers["Content-Length"]; !ok {
+		res.Headers["Content-Length"] = fmt.Sprintf("%d", len(res.Body))
+	}
+	if _, ok := res.Headers["Connection"]; !ok {
+		res.Headers["Connection"] = "close"
+	}
+
+	fmt.Fprintf(conn, "HTTP/1.1 %d %s\r\n", res.StatusCode, res.StatusText)
+	for k, v := range res.Headers {
+		fmt.Fprintf(conn, "%s: %s\r\n", k, v)
+	}
+	fmt.Fprint(conn, "\r\n")
+	fmt.Fprint(conn, res.Body)
+}
+
+func rootHandler(req *Request) Response {
+	return Response{200, "OK", nil, ""}
+}
+
+func userAgentHandler(req *Request) Response {
+	ua := req.Headers["user-agent"]
+	return Response{200, "OK", map[string]string{"Content-Type": "text/plain"}, ua}
+}
+
+func echoHandler(req *Request) Response {
+	re := regexp.MustCompile(`^/echo/(.+)$`)
+	m := re.FindStringSubmatch(req.Path)
+	if len(m) > 1 {
+		body := m[1]
+		return Response{200, "OK", map[string]string{"Content-Type": "text/plain"}, body}
+	}
+	return Response{404, "Not Found", nil, ""}
+}
+
+func fileHandler(req *Request) Response {
+	re := regexp.MustCompile(`^/files/(.+)$`)
+	m := re.FindStringSubmatch(req.Path)
+	if len(m) < 2 {
+		return Response{404, "Not Found", nil, ""}
+	}
+	filename := m[1]
+	filepath := fmt.Sprintf("app/files/%s", filename)
+
+	switch req.Method {
+	case "GET":
+		data, err := os.ReadFile(filepath)
+		if err != nil {
+			return Response{404, "Not Found", nil, ""}
+		}
+		return Response{200, "OK", map[string]string{"Content-Type": "application/octet-stream"}, string(data)}
+	case "POST":
+		os.WriteFile(filepath, []byte(req.Body), 0644)
+		return Response{201, "Created", nil, ""}
+	case "DELETE":
+		os.Remove(filepath)
+		return Response{200, "OK", nil, ""}
+	default:
+		return Response{405, "Method Not Allowed", nil, ""}
+	}
+}
+
+// Main Loop...
 
 func main() {
-	for _, route := range registeredRoutes {
-		routeSet[route] = struct{}{}
-	}
+	router := NewRouter()
+	router.Handle("/", rootHandler)
+	router.Handle("/user-agent", userAgentHandler)
+	router.HandleDynamic(`^/echo/[^/]+$`, echoHandler)
+	router.HandleDynamic(`^/files/[^/]+$`, fileHandler)
 
-	l, err := net.Listen("tcp", "0.0.0.0:4221")
+	listener, err := net.Listen("tcp", "0.0.0.0:4221")
 	if err != nil {
-		log.Fatal("Could not create listener")
+		log.Fatal(err)
 	}
-	defer l.Close()
+	log.Println("Server running on port 4221")
 
 	for {
-		con, err := l.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
-			return
-		}
-
-		go func(con net.Conn) {
-			defer con.Close()
-
-			buff := make([]byte, 4096)
-			_, err := con.Read(buff)
-
-			if err != nil {
-				log.Fatal("Could not read from connection")
-			}
-
-			handleUrl(&buff, &con)
-
-		}(con)
-	}
-}
-
-func extractHeaders(buffStr string) (map[string]string, string) {
-	parts := strings.SplitN(buffStr, "\r\n\r\n", 2)
-	headerPart := parts[0]
-	reqBody := parts[1]
-	lines := strings.Split(headerPart, "\r\n")
-	headers := lines[1:]
-
-	headerMap := make(map[string]string)
-
-	for _, line := range headers {
-		parts := strings.SplitN(line, ":", 2)
-
-		if len(parts) != 2 {
 			continue
 		}
-
-		key := strings.ToLower(strings.TrimSpace(parts[0]))
-		val := strings.TrimSpace(parts[1])
-
-		headerMap[key] = val
-	}
-
-	return headerMap, reqBody
-}
-
-func handleUrl(conBuff *[]byte, con *net.Conn) {
-	var out bool = false
-	buffStr := string(*conBuff)
-	reqLine := strings.Split(buffStr, "\n")[0]
-	reqType := strings.Split(reqLine, " ")[0]
-	reqUrl := strings.Split(reqLine, " ")[1]
-	fmt.Println(reqUrl)
-	headerMap, body := extractHeaders(buffStr)
-
-	if reqType == "POST" {
-		handlePost(con, &body, &reqUrl, &out)
-	}
-	if _, exists := routeSet[reqUrl]; exists {
-		switch reqUrl {
-		case "/":
-			n, err := (*con).Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
-			out = true
+		go func(conn net.Conn) {
+			defer conn.Close()
+			req, err := parseRequest(conn)
 			if err != nil {
-				log.Fatal("Could not write response")
+				log.Println("Failed to parse request:", err)
+				return
 			}
-
-			fmt.Printf("Wrote %v bytes\n", n)
-		case "/user-agent":
-			if value, ok := headerMap["user-agent"]; ok {
-				resp := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", len(value), value)
-				n, err := (*con).Write([]byte(resp))
-
-				if err != nil {
-					log.Fatal("Could not Write back")
-				}
-				fmt.Printf("Wrote %v bytes\n", n)
-				out = true
+			handler := router.FindHandler(req.Path)
+			if handler == nil {
+				writeResponse(conn, Response{404, "Not Found", nil, ""})
+				return
 			}
-
-		}
-	}
-
-	re := regexp.MustCompile(`^/echo/([^/]+)$`)
-	match := re.FindStringSubmatch(reqUrl)
-
-	if len(match) > 1 {
-		value := match[1]
-		resp := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", len(value), value)
-		fmt.Println(resp)
-
-		(*con).Write([]byte(resp))
-		out = true
-	}
-
-	re = regexp.MustCompile(`/files/([^/]+)$`)
-	match = re.FindStringSubmatch(reqUrl)
-
-	if len(match) > 1 {
-		value := match[1]
-		filePath := fmt.Sprintf("app/files/%s", value)
-		data, err := os.ReadFile(filePath)
-		if err != nil {
-			log.Println("Error reading file", err)
-			resp := "HTTP/1.1 404 Not Found\r\n\r\n"
-			(*con).Write([]byte(resp))
-			out = true
-			return
-		}
-		content := string(data)
-		resp := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %d\r\n\r\n%s", len(content), content)
-		fmt.Println(resp)
-		(*con).Write([]byte(resp))
-		out = true
-	}
-
-	if !out {
-		(*con).Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
+			res := handler(req)
+			writeResponse(conn, res)
+		}(conn)
 	}
 }
 
-func handlePost(con *net.Conn, body *string, url *string, out *bool) {
-	re := regexp.MustCompile(`/files/([^/]+)$`)
-
-	match := re.FindStringSubmatch(*url)
-	if len(match) > 1 {
-		fileName := match[1]
-		filePath := fmt.Sprintf("app/files/%s", fileName)
-		file, err := os.Create(filePath)
-		if err != nil {
-			log.Println("Could not create requested file")
-			resp := "HTTP/1.1 404 Not Found\r\n\r\n"
-			(*con).Write([]byte(resp))
-			*out = true
-			return
-		}
-
-		_, err = file.Write([]byte(*body))
-		if err != nil {
-			log.Println("Could not create requested file")
-			resp := "HTTP/1.1 404 Not Found\r\n\r\n"
-			(*con).Write([]byte(resp))
-			*out = true
-			return
-		}
-
-		(*con).Write([]byte("HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
-		*out = true
-	}
-}
