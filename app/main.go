@@ -2,12 +2,15 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"regexp"
 	"strings"
+	"time"
 )
 
 type Request struct {
@@ -26,8 +29,6 @@ type Response struct {
 }
 
 type HandlerFunc func(req *Request) Response
-
-// --- Router ---
 
 type Router struct {
 	staticRoutes  map[string]HandlerFunc
@@ -71,10 +72,26 @@ func (r *Router) FindHandler(path string) HandlerFunc {
 	return nil
 }
 
-// --- HTTP Parsing ---
+func getCompressedBody(headers map[string]string, body []byte) ([]byte, map[string]string) {
+	acceptEnc, ok := headers["accept-encoding"]
 
-func parseRequest(conn net.Conn) (*Request, error) {
-	reader := bufio.NewReader(conn)
+	if !ok {
+		return body, nil
+	}
+
+	if strings.Contains(acceptEnc, "gzip") {
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		gz.Write(body)
+		gz.Close()
+
+		return buf.Bytes(), map[string]string{"Content-Encoding": "gzip"}
+	}
+
+	return body, nil
+}
+
+func parseRequest(reader *bufio.Reader) (*Request, error) {
 	reqLine, err := reader.ReadString('\n')
 	if err != nil {
 		return nil, err
@@ -122,18 +139,24 @@ func parseRequest(conn net.Conn) (*Request, error) {
 	}, nil
 }
 
-// --- Response Writer ---
-
-func writeResponse(conn net.Conn, res Response) {
+func writeResponse(conn net.Conn, res Response, headers map[string]string) {
+	compressedBody, extraHeaders := getCompressedBody(headers, []byte(res.Body))
 	if res.Headers == nil {
 		res.Headers = make(map[string]string)
 	}
 
-	if _, ok := res.Headers["Content-Length"]; !ok {
-		res.Headers["Content-Length"] = fmt.Sprintf("%d", len(res.Body))
+	for k, v := range extraHeaders {
+		res.Headers[k] = v
 	}
-	if _, ok := res.Headers["Connection"]; !ok {
-		res.Headers["Connection"] = "close"
+
+	if _, ok := res.Headers["Content-Length"]; !ok {
+		res.Headers["Content-Length"] = fmt.Sprintf("%d", len(compressedBody))
+	}
+
+	if headers != nil && headers["connection"] == "close" {
+		res.Headers["connection"] = "close"
+	} else {
+		res.Headers["connection"] = "keep-alive"
 	}
 
 	fmt.Fprintf(conn, "HTTP/1.1 %d %s\r\n", res.StatusCode, res.StatusText)
@@ -141,7 +164,7 @@ func writeResponse(conn net.Conn, res Response) {
 		fmt.Fprintf(conn, "%s: %s\r\n", k, v)
 	}
 	fmt.Fprint(conn, "\r\n")
-	fmt.Fprint(conn, res.Body)
+	fmt.Fprint(conn, string(compressedBody))
 }
 
 func rootHandler(req *Request) Response {
@@ -211,20 +234,32 @@ func main() {
 			continue
 		}
 		go func(conn net.Conn) {
-			defer conn.Close()
-			req, err := parseRequest(conn)
-			if err != nil {
-				log.Println("Failed to parse request:", err)
-				return
+			// defer conn.Close()
+
+			readBuff := bufio.NewReader(conn)
+			for {
+				conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+				req, err := parseRequest(readBuff)
+				if err != nil {
+					log.Println("Failed to parse request:", err)
+					conn.Close()
+					return
+				}
+				handler := router.FindHandler(req.Path)
+				if handler == nil {
+					writeResponse(conn, Response{404, "Not Found", nil, ""}, nil)
+					return
+				}
+				res := handler(req)
+				writeResponse(conn, res, req.Headers)
+
+				if strings.ToLower(req.Headers["connection"]) == "close" {
+					conn.Close()
+					return
+				}
+
+				conn.SetReadDeadline(time.Time{})
 			}
-			handler := router.FindHandler(req.Path)
-			if handler == nil {
-				writeResponse(conn, Response{404, "Not Found", nil, ""})
-				return
-			}
-			res := handler(req)
-			writeResponse(conn, res)
 		}(conn)
 	}
 }
-
